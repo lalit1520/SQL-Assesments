@@ -1,0 +1,71 @@
+-- CREATE TABLE blinkit_city_insights AS
+WITH base AS (
+  -- only include stores that exist in blinkit_city_map (exclude unmapped stores)
+SELECT
+bcm.city_name, p.created_at::timestamp AS created_at_ts
+, p.created_at::date      AS date
+, (p.selling_price)::numeric AS selling_price
+, (p.mrp)::numeric AS mrp,p.brand_id,p.brand,p.image_url,p.l1_category_id
+, p.l2_category_id, p.sku_name, p.store_id, p.sku_id
+, (p.inventory)::integer  AS inventory
+, LAG(p.inventory::integer) OVER (PARTITION BY p.store_id, p.sku_id 
+							ORDER BY p.created_at::timestamp) AS prev_inventory
+FROM product_inventory p
+JOIN blinkit_city_map bcm
+ON p.store_id = bcm.store_id
+)
+, diffs AS (
+SELECT *, (prev_inventory - inventory) AS diff FROM base
+)
+, diffs_with_avg as (
+select *
+, case when diff > 0 then 'sales'
+	when diff <= 0 then 'restock'
+	when (prev_inventory is null) then 'prev_inv_unavailable' end as inv_cat
+, AVG(CASE WHEN diff > 0 THEN diff END) OVER (
+      PARTITION BY store_id, sku_id ORDER BY created_at_ts
+      ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING
+    ) AS avg_pos_diff_prev_3
+from diffs
+)
+, est_calc as (
+select *
+,  COALESCE(
+      CASE WHEN prev_inventory IS NULL THEN 0
+           WHEN diff  >  0 THEN diff
+       	   WHEN diff <= 0 THEN ROUND(COALESCE(avg_pos_diff_prev_3, 0))  -- restock: use avg of past positive diffs (rounded)
+        ELSE 0 END, 0)::integer AS est_qty_sold
+from diffs_with_avg
+)
+, ds_total AS (
+  -- total distinct dark stores present in product_inventory which have a city mapping
+SELECT COUNT(DISTINCT p.store_id) AS ds_count
+FROM product_inventory p
+JOIN blinkit_city_map bcm ON p.store_id = bcm.store_id
+)
+, agg AS (
+  -- final aggregation per date, city, sku, category
+SELECT
+e.date,e.brand_id,e.brand,e.image_url,e.city_name,e.sku_id
+, e.sku_name,e.l1_category_id as category_id,bc.l1_category AS category_name
+, e.l2_category_id as sub_category_id,bc.l2_category AS sub_category_name
+, SUM(e.est_qty_sold)                       AS est_qty_sold
+, SUM(e.est_qty_sold * e.selling_price)     AS est_sales_sp
+, SUM(e.est_qty_sold * e.mrp)               AS est_sales_mrp
+, COUNT(DISTINCT e.store_id)                AS listed_ds_count  -- unique stores where this SKU is seen
+, dt.ds_count AS ds_count
+, COUNT(DISTINCT CASE WHEN e.inventory > 0 THEN e.store_id END)::float
+	/ NULLIF(dt.ds_count, 0)                AS wt_osa           -- in-stock stores / total mapped stores
+, COUNT(DISTINCT CASE WHEN e.inventory > 0 THEN e.store_id END)::float
+	/ NULLIF(COUNT(DISTINCT e.store_id), 0) AS wt_osa_ls        -- in-stock stores / listed stores
+, MODE() WITHIN GROUP (ORDER BY e.mrp)      AS mrp
+, MODE() WITHIN GROUP (ORDER BY e.selling_price) AS sp
+FROM est_calc e
+LEFT JOIN blinkit_categories bc
+	ON e.l1_category_id = bc.l1_category_id AND e.l2_category_id = bc.l2_category_id
+CROSS JOIN ds_total dt
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11, ds_count
+)
+select * 
+, round(case when mrp = 0 then 0 else (mrp-sp)*100.00/mrp end, 2) || ' %' as discount
+from agg
